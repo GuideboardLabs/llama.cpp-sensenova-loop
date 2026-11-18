@@ -126,6 +126,8 @@ class SenseNovaLoopModel(Qwen3_5TextModel):
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         if name.startswith("model.visual."):
             return  # text-only: vision tower stays out of this file
+        if ".loop_gate." in name:
+            return  # release checkpoints carry it, the reference forward never reads it
 
         m = re.match(r"model\.(?:language_model\.)?layers\.(\d+)\.(.+)$", name)
         if m:
@@ -145,3 +147,10 @@ class SenseNovaLoopModel(Qwen3_5TextModel):
             return
 
         yield from super().modify_tensors(data_torch, name.replace("model.language_model.", "model."), bid)
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
+        # the residual routers are trained and applied in fp32 (mhc_route asserts F32): narrowing
+        # their weights to the output type would round them before the quantizer widens them again
+        if ".mhc_" in new_name:
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)

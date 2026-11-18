@@ -86,6 +86,16 @@ struct llm_build_delta_net_base : public llm_graph_context {
             int64_t              conv_channels,
             int                  il);
 
+    // the same with the cache holding the conv inputs of the last ubatch, one row per time step
+    // (llama_memory_recurrent::rs_lazy): the conv state is the rows after the tokens that were kept
+    ggml_tensor * build_conv_state_lazy(
+            llm_graph_input_rs * inp,
+            ggml_tensor *        conv_states_all,
+            ggml_tensor *        qkv_mixed,
+            int64_t              conv_kernel_size,
+            int64_t              conv_channels,
+            int                  il);
+
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
     ggml_tensor * build_recurrent_attn(
@@ -97,6 +107,19 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        g,
             ggml_tensor *        b,
             ggml_tensor *        s,
+            int                  il);
+
+    // the same over a state kept as a base and the updates of the last ubatch (llama_memory_recurrent::rs_lazy):
+    // reads them from ssm_states_all and ssm_factors_all, and writes the new ones back
+    ggml_tensor * build_recurrent_attn_lazy(
+            llm_graph_input_rs * inp,
+            ggml_tensor *        ssm_states_all,
+            ggml_tensor *        ssm_factors_all,
+            ggml_tensor *        q,
+            ggml_tensor *        k,
+            ggml_tensor *        v,
+            ggml_tensor *        g,
+            ggml_tensor *        b,
             int                  il);
 };
 

@@ -126,6 +126,7 @@
 #define FC_LIGHTNING_INDEXER           2200
 #define FC_MUL_MV_MMA                  2300
 #define FC_TOP_K_MASK                  2400
+#define FC_GATED_DELTA_NET_LAZY        2500
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -184,6 +185,8 @@
 #define OP_SSM_SCAN_SSD_CS  64 // Metal-specific; Chunk Size; 64 is largest multiple of 8 (simdgroup tile) fitting into 32 KiB Metal threadgroup mem limit (~26.75 KiB shared mem; see smem layout comment in kernel_ssm_scan_ssd_mma_f32)
 #define OP_SSM_SCAN_SSD_HD  64 // Metal-specific; Head Dim the MMA kernel is specialized for (Mamba-2); use_mma gates on d_inner == this
 #define OP_SSM_SCAN_SSD_NSG 4  // Metal-specific; Number of SimdGroups per threadgroup; NSG*32 == threads dispatched per threadgroup
+
+#define OP_MHC_ROUTE_NRED 9 // Metal-specific; Number of REDuctions per row: sum of squares + 8 router logits; each takes 32 floats of threadgroup mem
 
 // kernel argument structs
 //
@@ -1011,6 +1014,24 @@ typedef struct {
 } ggml_metal_kargs_gated_delta_net;
 
 typedef struct {
+    int32_t  ne01;
+    int32_t  ne11;
+    int32_t  ne21;
+    int32_t  ne22;
+    int32_t  ne23;
+    int32_t  ns02;
+    int32_t  ns12;
+    int32_t  ns22;
+    uint64_t nb01;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb13;
+    uint64_t nb21;
+    uint64_t nb23;
+    int32_t  fused; // 1 => the new base goes straight to the recurrent cache (dst_fuse), not after the attn scores
+} ggml_metal_kargs_gated_delta_net_lazy;
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne01;
     int32_t  ne02;
@@ -1372,6 +1393,31 @@ typedef struct {
     uint64_t nb_d1;
     uint64_t nb_d2;
 } ggml_metal_kargs_dsv4_hc_post;
+
+typedef struct {
+    int32_t  n_embd;
+    uint64_t nb_a1;
+    uint64_t nb_a2;
+    uint64_t nb_b1;
+    uint64_t nb_b2;
+    uint64_t nb_w1;
+    uint64_t nb_d1;
+    uint64_t nb_d2;
+} ggml_metal_kargs_mhc_route;
+
+typedef struct {
+    int32_t  n_embd;
+    uint64_t nb_a1;
+    uint64_t nb_a2;
+    uint64_t nb_b1;
+    uint64_t nb_b2;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb_p1;
+    uint64_t nb_p2;
+    uint64_t nb_d1;
+    uint64_t nb_d2;
+} ggml_metal_kargs_mhc_merge;
 
 typedef struct {
     int32_t  ne00;

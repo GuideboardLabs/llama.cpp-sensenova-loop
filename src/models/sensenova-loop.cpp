@@ -263,6 +263,16 @@ llama_model_sensenova_loop::graph::graph(const llama_model & model, const llm_gr
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
 
+        // inside the mHC range the residual is two streams and inpL is a strided view of the first,
+        // which a reader of layer inputs (a DFlash draft) cannot take as one row per token: give it
+        // the mean of the streams, the same reduction the model applies when it leaves the range
+        if (str_a != nullptr && (size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            ggml_tensor * tap = ggml_scale(ctx0, ggml_add(ctx0, str_a, str_b), 0.5f);
+            cb(tap, "layer_inp_mean", il);
+            ggml_build_forward_expand(gf, tap);
+            res->t_layer_inp[il] = tap;
+        }
+
         const uint32_t mhc_kind = hparams.n_mhc_streams > 0 ? hparams.mhc_layer_kinds[il] : 0;
 
         if (mhc_kind == 0) {
@@ -525,11 +535,20 @@ ggml_tensor * llama_model_sensenova_loop::graph::build_layer_attn_linear(
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+    // the states are gathered here, unless the memory keeps them lazily: the delta-net state as a base and
+    // its last updates, which the op reads in place, and the conv state as rows of the last conv inputs
+    const bool lazy = mctx_cur->rs_lazy();
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
+    ggml_tensor * conv_input = lazy
+        ? build_conv_state_lazy(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il)
+        : build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+
+    ggml_tensor * state = nullptr;
+    if (!lazy) {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        cb(state, "state_predelta", il);
+    }
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
@@ -578,7 +597,7 @@ ggml_tensor * llama_model_sensenova_loop::graph::build_layer_attn_linear(
 
     // if head keys and value keys are different, repeat to force tensors into matching shapes
     // note: need explicit repeat only if we are not using the fused GDN.
-    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+    if (num_k_heads != num_v_heads && !lazy && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
         GGML_ASSERT(num_v_heads % num_k_heads == 0);
         q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
         k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
@@ -588,7 +607,9 @@ ggml_tensor * llama_model_sensenova_loop::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    ggml_tensor * output = lazy
+        ? build_recurrent_attn_lazy(inp, ssm_states_all, mctx_cur->get_f_l(il), q_conv, k_conv, v_conv, gate, beta, il)
+        : build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
