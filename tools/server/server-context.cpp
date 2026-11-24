@@ -315,6 +315,14 @@ struct server_slot {
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
 
+    // tokens of the last prompt, and whether the prompt after it kept tokens that were generated for it
+    // (see --ctx-checkpoint-turns)
+    int32_t n_prompt_last    = 0;
+    bool    prompt_continued = false;
+
+    // the batch before this one was cut for --prompt-tile: what is left of the prompt needs no checkpoint
+    bool prompt_tile_cut = false;
+
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
 
@@ -2724,6 +2732,11 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // the checkpoint at the start of the first user message sits right after the system prompt and
+        // the tool definitions. a new conversation with the same ones resumes from it instead of
+        // re-processing them, so it is the last checkpoint to be evicted
+        const int64_t n_tokens_base = slot.task->params.message_spans.first_user_message_pos();
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -2731,7 +2744,7 @@ private:
         for (auto it = slot.prompt.checkpoints.begin();
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            if (it->id_task != id_task && it->n_tokens != n_tokens_base && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -2744,13 +2757,16 @@ private:
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            // make room for the new checkpoint, if needed: the oldest one that is not the base
+            auto it = slot.prompt.checkpoints.begin();
+            if (it->n_tokens == n_tokens_base && std::next(it) != slot.prompt.checkpoints.end()) {
+                ++it;
+            }
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                    it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(it);
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -4036,6 +4052,9 @@ private:
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
 
+                        slot.prompt_continued = false;
+                        slot.prompt_tile_cut  = false;
+
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
                             SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
@@ -4188,6 +4207,9 @@ private:
 
                             // number of cached tokens shared with the new prompt, before any checkpoint is restored
                             const int n_prefix = n_past;
+
+                            // the client sent back what the model wrote for the prompt before this one
+                            slot.prompt_continued = slot.n_prompt_last > 0 && n_prefix > slot.n_prompt_last;
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
@@ -4460,6 +4482,29 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    // --ctx-checkpoint-turns: cut the prompt for a checkpoint only where that pays. a pass
+                    // over a few tokens costs most of a pass over many, and a request has two such passes
+                    // otherwise: the tokens before its last user message, and its last 4 tokens.
+                    //  - a user message that starts within the first tokens of the batch does not cut it:
+                    //    the checkpoint before the batch stands in for the one at the message
+                    //  - the last tokens are not held back when the prompt before this one was continued
+                    //    token for token, generated tokens included. the checkpoint before them is for a
+                    //    client whose next prompt differs from what was generated (a template that drops
+                    //    an empty reasoning block, a regenerated answer); that client comes back to it on
+                    //    every request and keeps it. one that changes its ways re-reads its last message once
+                    const bool whole_turns     = params_base.checkpoint_whole_turns;
+                    const bool tail_checkpoint = !(whole_turns && slot.prompt_continued);
+                    // a user message that starts this close to the start of the batch does not cut it
+                    constexpr int32_t n_user_start_slack = 8;
+                    bool user_start_in_batch      = false;
+                    bool last_user_start_in_batch = false;
+
+                    // --prompt-tile N: the kernels for many rows work in tiles of N, and a pass pays for every
+                    // tile it starts: 40 tokens cost as much as 64. the kernels for few rows take up to N/2.
+                    // when what is left over after whole tiles fits in those, it goes into a pass of its own:
+                    // 40 tokens as 32 + 8. on an M4 that is 531 ms instead of 713
+                    const int32_t prompt_tile = params_base.prompt_tile;
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -4504,7 +4549,11 @@ private:
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if (whole_turns && (int32_t) (batch.size() - n_tokens_prev) <= n_user_start_slack) {
+                                // the checkpoint before this batch stands in for one at the message
+                                user_start_in_batch = true;
+                                last_user_start_in_batch = last_user_start_in_batch || pos == last_user_pos;
+                            } else if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
                                 break;
                             }
                         }
@@ -4514,7 +4563,7 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
+                        if (do_checkpoint && tail_checkpoint) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
@@ -4529,6 +4578,23 @@ private:
                                 break;
                             }
                         }
+
+                        if (prompt_tile > 0 && !(do_checkpoint && tail_checkpoint)) {
+                            const int32_t n_cur   = (int32_t) (batch.size() - n_tokens_prev);
+                            const int32_t n_left  = slot.task->n_tokens() - slot.prompt.n_tokens();
+                            const int32_t n_total = n_cur + n_left;
+
+                            // only when the rest of the prompt would go into this batch
+                            if (n_left > 0 && n_total <= n_batch - (int32_t) n_tokens_prev) {
+                                const int32_t n_over = n_total % prompt_tile;
+
+                                if (n_total > prompt_tile && n_over > 0 && n_over <= prompt_tile/2 && n_cur == n_total - n_over) {
+                                    SLT_DBG(slot, "prompt cut for --prompt-tile: %d tokens now, %d in a pass of their own\n", n_cur, n_left);
+                                    slot.prompt_tile_cut = true;
+                                    break;
+                                }
+                            }
+                        }
                     }
 
                     // the number of tokens added to the batch for the current slot
@@ -4538,12 +4604,13 @@ private:
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
-                    const bool is_user_start = spans.is_user_start(n_tokens_start);
-                    const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    const bool is_user_start = spans.is_user_start(n_tokens_start) || user_start_in_batch;
+                    const bool is_last_user_message = n_tokens_start == last_user_pos || last_user_start_in_batch;
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
+                        slot.n_prompt_last = slot.task->n_tokens();
 
                         GGML_ASSERT(batch.size() > 0);
 
@@ -4560,6 +4627,14 @@ private:
                         if (!is_user_start && !near_prompt_end) {
                             do_checkpoint = false;
                         }
+                    }
+
+                    // the rest of a prompt that was cut for --prompt-tile: the checkpoint before the cut does
+                    if (slot.prompt_tile_cut && n_tokens_start > 0 && slot.prompt.n_tokens() == slot.task->n_tokens()) {
+                        do_checkpoint = false;
+                    }
+                    if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
+                        slot.prompt_tile_cut = false;
                     }
 
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);

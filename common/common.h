@@ -392,6 +392,10 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
+    // tokens a recurrent model can take back after a ubatch without a checkpoint; 0: what the block drafters need.
+    // a draft longer than that (from the prompt, e.g.) is checkpointed, and replayed when it is accepted in part
+    int32_t n_rollback = 0;
+
     bool has_dft() const {
         return !draft.mparams.empty();
     }
@@ -405,7 +409,7 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        return std::max<uint32_t>(needs_rs_seq ? draft.n_max : 0u, (uint32_t) n_rollback);
     }
 };
 
@@ -641,6 +645,8 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    bool    checkpoint_whole_turns = false; // context checkpoints only where the new tokens of a request start
+    int32_t prompt_tile         = 0;     // rows a backend handles per tile in a prompt pass, to cut prompts at; 0 = no cuts
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 

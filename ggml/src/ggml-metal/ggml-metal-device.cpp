@@ -588,6 +588,31 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mhc(ggml_metal_library_t lib, const ggml_tensor * op) {
+    char base[256];
+    char name[256];
+
+    switch (op->op) {
+        case GGML_OP_MHC_ROUTE: snprintf(base, 256, "kernel_mhc_route_%s", ggml_type_name(op->type)); break;
+        case GGML_OP_MHC_MERGE: snprintf(base, 256, "kernel_mhc_merge_%s", ggml_type_name(op->type)); break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    if (op->op == GGML_OP_MHC_ROUTE) {
+        res.smem = OP_MHC_ROUTE_NRED*32*sizeof(float);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(
         ggml_metal_library_t lib, const ggml_tensor * op, int32_t nc, bool use_silu) {
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
@@ -780,6 +805,37 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net_lazy(ggml_metal_library_t lib, const ggml_tensor * op) {
+    char base[256];
+    char name[256];
+
+    const int ne20 = op->src[2]->ne[0]; // S_v
+    const int K    = ggml_get_op_params_i32(op, 0);
+
+    const int nsg = ne20/32;
+
+    GGML_ASSERT(ne20 % 32 == 0);
+
+    snprintf(base, 256, "kernel_gated_delta_net_lazy_%s_%d", ggml_type_name(op->src[0]->type), nsg);
+    snprintf(name, 256, "%s_ne20=%d_K=%d", base, ne20, K);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int16(cv, ne20, FC_GATED_DELTA_NET_LAZY + 0);
+        ggml_metal_cv_set_int16(cv, K,    FC_GATED_DELTA_NET_LAZY + 1);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nsg = nsg;
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
     char name[256];
@@ -934,7 +990,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma(ggml_
     // the specialized kernels unroll over a compile-time row length
     const int ne00 = ggml_metal_mul_mv_mma_kind(tsrc0, rt) != GGML_METAL_MMA_KIND_GEN ? op->src[0]->ne[0] : 0;
 
-    snprintf(base, 256, "kernel_mul_mv_mma_%s_%s_nt%d_rt%d", ggml_type_name(tsrc0), ggml_type_name(tsrc1), nt, rt);
+    const char * tname0 = tsrc0 == GGML_TYPE_Q4_K && ggml_metal_mul_mv_mma_q4_K_gen() ? "q4_K_gen" : ggml_type_name(tsrc0);
+    snprintf(base, 256, "kernel_mul_mv_mma_%s_%s_nt%d_rt%d", tname0, ggml_type_name(tsrc1), nt, rt);
     snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_ne00=%d_add=%d", base, nsg, ne12, r2, r3, ne00, add);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -958,6 +1015,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma(ggml_
 
     res.nr0 = GGML_METAL_MMA_TILE*nt;
     res.nr1 = GGML_METAL_MMA_TILE*rt;
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma_sums(ggml_metal_library_t lib) {
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, "kernel_mul_mv_mma_sums_f32");
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, "kernel_mul_mv_mma_sums_f32", "kernel_mul_mv_mma_sums_f32", nullptr);
+    }
 
     return res;
 }
